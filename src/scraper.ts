@@ -1,173 +1,125 @@
-// Import required libraries
-import axios, { AxiosResponse } from "axios";
-import * as cheerio from "cheerio";
-import * as fs from "fs";
-import { parse } from "json2csv";
-import * as cron from "node-cron";
+// ============== MAIN SCRAPER ORCHESTRATOR ==============
+// This file coordinates all the modules to scrape books
 
-// Import our type definitions
-import { Book, ScraperConfig } from "./types";
-
-// Configuration with types
-const config: ScraperConfig = {
-  baseUrl: "https://books.toscrape.com/catalogue/page-",
-  totalPages: 3,
-  delayMs: 1000,
-};
+import { config } from "./config";
+import { wait, buildPageUrl, downloadPage } from "./utils/http";
+import { extractBooksFromHTML } from "./utils/parser";
+import { saveBooksToFile } from "./utils/storage";
+import { setupScheduler } from "./utils/scheduler";
+import { ScrapingError } from "./utils/errors";
+import { Book } from "./types";
 
 /**
- * Main scraping function
- * Scrapes books from multiple pages and returns array of Book objects
+ * Scrape a single page
+ * Combines HTTP download and HTML parsing for one page
+ */
+async function scrapeSinglePage(pageNumber: number): Promise<Book[]> {
+  console.log(`📖 Scraping page ${pageNumber}...`);
+
+  // Step 1: Build the URL for this page
+  const url = buildPageUrl(config.websiteUrl, pageNumber);
+
+  // Step 2: Download the HTML from the webpage
+  const html = await downloadPage(url, pageNumber);
+
+  // Step 3: Extract book information from the HTML
+  const booksOnPage = extractBooksFromHTML(html, pageNumber);
+
+  console.log(`   ✅ Found ${booksOnPage.length} books on page ${pageNumber}`);
+
+  return booksOnPage;
+}
+
+/**
+ * Main scraping function that orchestrates the entire process
+ *
+ * Features:
+ * 1. Targeted scraping of specific data fields
+ * 2. Pagination handling for multiple pages
+ * 3. Comprehensive error handling
+ * 4. Data storage in JSON and CSV formats
  */
 async function scrapeBooks(): Promise<Book[]> {
-  console.log("Starting to scrape books...\n");
+  console.log("=".repeat(60));
+  console.log("       📚 BOOK SCRAPER - Starting...");
+  console.log("=".repeat(60));
+  console.log("");
 
-  // Explicitly type the array as Book[]
+  // This array will hold all the books we scrape
   const allBooks: Book[] = [];
+  let errors = 0;
 
-  // Loop through each page
+  // Loop through each page we want to scrape (PAGINATION FEATURE)
   for (let page = 1; page <= config.totalPages; page++) {
-    console.log(`📖 Scraping page ${page}...`);
-
     try {
-      // Build URL for current page
-      const url: string = `${config.baseUrl}${page}.html`;
+      // Scrape the current page
+      const booksOnPage = await scrapeSinglePage(page);
 
-      // Make HTTP request with typed response
-      const response: AxiosResponse<string> = await axios.get(url);
+      // Add these books to our collection
+      allBooks.push(...booksOnPage);
 
-      // Load HTML into Cheerio
-      const $ = cheerio.load(response.data);
-      // Find all book containers and extract data
-      $(".product_pod").each((index: number, element: cheerio.Element) => {
-        // Extract data with type safety
-        const title: string =
-          $(element).find("h3 a").attr("title") || "Unknown";
-        const price: string = $(element).find(".price_color").text();
-        const availability: string = $(element)
-          .find(".availability")
-          .text()
-          .trim();
+      // Wait before scraping the next page
+      // (Only wait if there are more pages to scrape)
+      if (page < config.totalPages) {
+        console.log(`   ⏳ Waiting ${config.delayBetweenRequests}ms...\n`);
+        await wait(config.delayBetweenRequests);
+      }
 
-        // Extract star rating
-        const ratingClass: string =
-          $(element).find(".star-rating").attr("class") || "";
-        const rating: string = ratingClass.split(" ")[1] || "No rating";
-
-        // Create book object with proper typing
-        const book: Book = {
-          title,
-          price,
-          rating,
-          availability,
-          scrapedAt: new Date().toISOString(),
-        };
-
-        // Add to array
-        allBooks.push(book);
-      });
-
-      console.log(`✅ Page ${page} scraped successfully!`);
-
-      // Wait before next request
-      await delay(config.delayMs);
     } catch (error) {
-      // Type guard for error handling
-      if (error instanceof Error) {
-        console.error(`❌ Error scraping page ${page}:`, error.message);
+      // Handle errors gracefully - continue to next page
+      errors++;
+      if (error instanceof ScrapingError) {
+        console.error(`   ❌ ${error.message}`);
       } else {
-        console.error(`❌ Unknown error scraping page ${page}`);
+        console.error(`   ❌ Unexpected error on page ${page}:`, error);
       }
     }
   }
 
-  console.log(`\n🎉 Scraped ${allBooks.length} books total!\n`);
+  console.log("");
+  console.log("=".repeat(60));
+  console.log(`🎉 Done! Scraped ${allBooks.length} books in total!`);
+  if (errors > 0) {
+    console.log(`⚠️  Encountered errors on ${errors} page(s)`);
+  }
+  console.log("=".repeat(60));
+  console.log("");
+
+  // Save all the books to files (DATA STORAGE FEATURE)
+  saveBooksToFile(allBooks);
 
   return allBooks;
 }
 
 /**
- * Helper function to create delay
- * @param ms - Milliseconds to wait
+ * Wrapper function for scheduler (ignores return value)
  */
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+async function runScheduledScrape(): Promise<void> {
+  await scrapeBooks();
 }
 
 /**
- * Save scraped data to JSON and CSV files
- * @param books - Array of Book objects to save
- */
-async function saveData(books: Book[]): Promise<void> {
-  try {
-    // Ensure data directory exists
-    if (!fs.existsSync("./data")) {
-      fs.mkdirSync("./data");
-    }
-
-    // Save as JSON
-    const jsonData: string = JSON.stringify(books, null, 2);
-    fs.writeFileSync("./data/books.json", jsonData, "utf-8");
-    console.log("💾 Saved to data/books.json");
-
-    // Save as CSV
-    const csv: string = parse(books);
-    fs.writeFileSync("./data/books.csv", csv, "utf-8");
-    console.log("💾 Saved to data/books.csv");
-
-    console.log("\n✨ Scraping complete!\n");
-  } catch (error) {
-    if (error instanceof Error) {
-      console.error("❌ Error saving data:", error.message);
-    } else {
-      console.error("❌ Unknown error while saving data");
-    }
-    throw error;
-  }
-}
-
-/**
- * Schedule scraping to run at specific times
- * Uses cron syntax for scheduling
- */
-function scheduleScraping(): void {
-  console.log("⏰ Scheduler activated!");
-  console.log("Will run every day at 9:00 AM\n");
-
-  // Cron format: minute hour day month weekday
-  cron.schedule("0 9 * * *", async () => {
-    console.log("\n🔔 Scheduled scraping started...");
-    const books = await scrapeBooks();
-    await saveData(books);
-  });
-
-  // Keep the process running
-  console.log("Scheduler is running... Press Ctrl+C to stop.\n");
-}
-
-/**
- * Main execution function
+ * Main entry point - runs scraper and optionally sets up scheduler
  */
 async function main(): Promise<void> {
-  console.log("=".repeat(50));
-  console.log("       📚 BOOK SCRAPER V2.0 (TypeScript) 📚");
-  console.log("=".repeat(50));
-  console.log("");
-
   try {
-    // Run scraper immediately
-    const books = await scrapeBooks();
-    await saveData(books);
+    // Run the scraper immediately
+    await scrapeBooks();
 
-    // Uncomment to enable scheduling:
-    // scheduleScraping();
-  } catch (error) {
-    if (error instanceof Error) {
-      console.error("Fatal error:", error.message);
+    // Set up scheduler if enabled
+    if (config.enableScheduler) {
+      setupScheduler(runScheduledScrape);
+    } else {
+      console.log("ℹ️  To enable automatic scheduling, edit config.ts");
+      console.log("   Set 'enableScheduler: true' and choose your schedule time\n");
+      // Exit if scheduler is not enabled
+      process.exit(0);
     }
+  } catch (error) {
+    console.error("\n❌ Fatal error:", error);
     process.exit(1);
   }
 }
 
-// Execute main function
+// Start the scraper
 main();
